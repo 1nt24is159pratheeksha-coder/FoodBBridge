@@ -6,8 +6,10 @@
 export const DISCLAIMER =
   "AI visual screening does not guarantee food safety. Final acceptance remains subject to applicable food-safety procedures and provider confirmation.";
 
+import { analyzeFoodImage, type AssessmentResult } from "./assessment-engine.ts";
+import { ASSESSMENT_RETRY_MESSAGE } from "./assessment-result.ts";
+
 export const QUALITY_STATUSES = ["ELIGIBLE", "REVIEW_REQUIRED", "URGENT", "REJECTED"] as const;
-type Quality = (typeof QUALITY_STATUSES)[number];
 export type Mode = "live" | "demo";
 
 export interface InboundMessage {
@@ -18,15 +20,7 @@ export interface InboundMessage {
   mode: Mode;
 }
 
-interface Analysis {
-  food_name: string;
-  estimated_portions: number;
-  estimated_weight_kg: number;
-  quality_screening_status: Quality;
-  assessment_note: string;
-  analysis_mode: "live_ai" | "demo_simulation";
-  model: string | null;
-}
+type Analysis = AssessmentResult;
 
 async function db() {
   const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
@@ -55,91 +49,16 @@ export async function downloadTwilioMedia(url: string): Promise<{ base64: string
   if (!match) throw new Error("Unexpected media URL");
   const res = await fetch(`https://connector-gateway.lovable.dev/twilio/Messages/${match[1]}/Media/${match[2]}`, {
     headers: { Authorization: `Bearer ${lovableKey}`, "X-Connection-Api-Key": twilioKey },
+    signal: AbortSignal.timeout(15_000),
   });
-  if (!res.ok) throw new Error(`Media download failed [${res.status}]: ${await res.text()}`);
+  if (!res.ok) throw new Error(`Media download failed [${res.status}]`);
   const size = Number(res.headers.get("content-length") ?? 0);
   if (size > 8 * 1024 * 1024) throw new Error("Image too large");
   const buf = Buffer.from(await res.arrayBuffer());
   if (buf.length > 8 * 1024 * 1024) throw new Error("Image too large");
-  return { base64: buf.toString("base64"), contentType: res.headers.get("content-type") ?? "image/jpeg" };
-}
-
-const MODEL = "google/gemini-3-flash-preview";
-
-async function analyzeWithAI(base64: string, contentType: string): Promise<Analysis> {
-  const key = process.env['LOVABLE_API_KEY'];
-  if (!key) throw new Error("LOVABLE_API_KEY missing");
-  const res = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
-    method: "POST",
-    headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: MODEL,
-      messages: [
-        {
-          role: "system",
-          content:
-            "You assist an institutional food-rescue service. Look at a photo of surplus cooked/prepared food from a kitchen. Identify the food, estimate how many standard adult portions (~300-450 g each) are visible, and the total food weight in kg. Then perform ONLY a visual quality screening: ELIGIBLE (no visible issues), REVIEW_REQUIRED (unclear image, unusual appearance, can't judge), URGENT (looks fine but appears to be degrading / should move very soon), REJECTED (visible spoilage, mould, contamination, or not food). Never claim food is safe; you only screen visible characteristics. Keep the note to one short sentence.",
-        },
-        {
-          role: "user",
-          content: [
-            { type: "text", text: "Assess this surplus food photo." },
-            { type: "image_url", image_url: { url: `data:${contentType};base64,${base64}` } },
-          ],
-        },
-      ],
-      tools: [
-        {
-          type: "function",
-          function: {
-            name: "report_assessment",
-            description: "Report the visual food assessment",
-            parameters: {
-              type: "object",
-              properties: {
-                food_name: { type: "string" },
-                estimated_portions: { type: "integer", minimum: 0 },
-                estimated_weight_kg: { type: "number", minimum: 0 },
-                quality_screening_status: { type: "string", enum: [...QUALITY_STATUSES] },
-                assessment_note: { type: "string" },
-              },
-              required: ["food_name", "estimated_portions", "estimated_weight_kg", "quality_screening_status", "assessment_note"],
-              additionalProperties: false,
-            },
-          },
-        },
-      ],
-      tool_choice: { type: "function", function: { name: "report_assessment" } },
-    }),
-  });
-  if (!res.ok) throw new Error(`AI request failed [${res.status}]: ${await res.text()}`);
-  const json = await res.json();
-  const args = json.choices?.[0]?.message?.tool_calls?.[0]?.function?.arguments;
-  if (!args) throw new Error("AI returned no structured result");
-  const p = JSON.parse(args);
-  const status = QUALITY_STATUSES.includes(p.quality_screening_status) ? p.quality_screening_status : "REVIEW_REQUIRED";
-  return {
-    food_name: String(p.food_name).slice(0, 120),
-    estimated_portions: Math.max(0, Math.round(Number(p.estimated_portions) || 0)),
-    estimated_weight_kg: Math.max(0, Math.round((Number(p.estimated_weight_kg) || 0) * 10) / 10),
-    quality_screening_status: status,
-    assessment_note: String(p.assessment_note).slice(0, 300),
-    analysis_mode: "live_ai",
-    model: MODEL,
-  };
-}
-
-/** Clearly-labelled fallback used only when the AI cannot be reached. */
-function demoSimulation(): Analysis {
-  return {
-    food_name: "Vegetable Rice",
-    estimated_portions: 40,
-    estimated_weight_kg: 18,
-    quality_screening_status: "ELIGIBLE",
-    assessment_note: "Demo / Simulation result — the photo was NOT analysed by AI.",
-    analysis_mode: "demo_simulation",
-    model: null,
-  };
+  const contentType = res.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase() ?? "";
+  if (!contentType.startsWith("image/")) throw new Error("Twilio media is not an image");
+  return { base64: buf.toString("base64"), contentType };
 }
 
 function assessmentMessage(a: { food_name: string; ai_estimated_quantity: number | null; confirmed_quantity: number | null; ai_estimated_weight: number | null; quality_screening_status: string; assessment_note: string | null; analysis_mode: string }) {
@@ -214,17 +133,18 @@ async function route(kitchen: KitchenRow | null, type: string, msg: InboundMessa
       const media = msg.media!.base64
         ? { base64: msg.media!.base64, contentType: msg.media!.contentType }
         : await downloadTwilioMedia(msg.media!.url!);
-      analysis = await analyzeWithAI(media.base64, media.contentType);
-    } catch (e) {
-      console.error("AI/media failure, using Demo / Simulation", e);
-      analysis = demoSimulation();
-      imageRef = imageRef + " (not analysed)";
+      analysis = await analyzeFoodImage(media.base64, media.contentType);
+    } catch {
+      return ASSESSMENT_RETRY_MESSAGE;
     }
     const { data: a, error } = await supabase.from("food_assessments").insert({
       kitchen_id: kitchen.id, message_id: inboundId, image_reference: imageRef,
       food_name: analysis.food_name, ai_estimated_quantity: analysis.estimated_portions,
       ai_estimated_weight: analysis.estimated_weight_kg, quality_screening_status: analysis.quality_screening_status,
-      assessment_note: analysis.assessment_note, analysis_mode: analysis.analysis_mode, model: analysis.model,
+      assessment_note: `${analysis.assessment_note} Limitations: ${analysis.limitations.join("; ")}`.slice(0, 300),
+      analysis_mode: analysis.analysis_mode, model: analysis.model,
+      visual_quality: analysis.visual_quality, freshness: analysis.freshness,
+      confidence_percent: analysis.confidence_percent, safety_status: analysis.safety_status,
     }).select("*").single();
     if (error) throw new Error(error.message);
     await supabase.from("kitchens").update({ conversation_state: "awaiting_confirmation", pending_assessment_id: a.id }).eq("id", kitchen.id);

@@ -15,6 +15,9 @@
 
 import { normalizePhone, classify, type InboundMessage, type Mode } from "./pipeline.server";
 import { analyzeFoodImage, type AssessmentResult } from "./assessment-engine";
+import { ASSESSMENT_RETRY_MESSAGE } from "./assessment-result";
+import { extractRegistrationFields, isConversationalQuestion, parseRegistrationCapacityAnswer, REGISTRATION_KEYS } from "./registration-input";
+import { requestGroqText } from "./groq-ai.server";
 import { rankNgosForSurplus } from "./matching-engine";
 
 export { normalizePhone, classify };
@@ -23,7 +26,7 @@ export type Channel = "whatsapp" | "admin_simulator";
 
 export interface ConversationInput {
   from: string;
-  text: string;
+  text: unknown;
   messageSid?: string;
   media?: { url?: string; contentType: string; base64?: string } | null;
   channel: Channel;
@@ -158,6 +161,119 @@ function detectIntent(text: string): string {
   return "unknown";
 }
 
+export function normalizeConversationText(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (typeof value === "number" && Number.isFinite(value)) return String(value);
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    const record = value as Record<string, unknown>;
+    const candidate = record["text"] ?? record["body"] ?? record["caption"];
+    return typeof candidate === "string" || typeof candidate === "number" ? String(candidate) : "";
+  }
+  return "";
+}
+
+export function normalizeConversationMedia(value: unknown, explicit?: ConversationInput["media"]): ConversationInput["media"] {
+  if (explicit) return explicit;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  const nested = record["image"] ?? record["media"];
+  const candidate = nested && typeof nested === "object" && !Array.isArray(nested)
+    ? nested as Record<string, unknown>
+    : record;
+  const contentType = candidate["contentType"] ?? candidate["mimeType"];
+  const base64 = candidate["base64"] ?? candidate["data"];
+  const url = candidate["url"];
+  if (typeof contentType !== "string" || !contentType.startsWith("image/")) return null;
+  return {
+    contentType,
+    ...(typeof base64 === "string" ? { base64 } : {}),
+    ...(typeof url === "string" ? { url } : {}),
+  };
+}
+
+export function parseNaturalKitchenDetails(text: string): Record<string, string | number> {
+  return extractRegistrationFields(text);
+}
+
+function modelSafeText(text: string): string {
+  return text.slice(0, 500)
+    .replace(/[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}/g, "[email omitted]")
+    .replace(/(?:\+?\d[\d ()-]{7,}\d)/g, "[phone omitted]");
+}
+
+async function recentAssistantContext(phone: string): Promise<string> {
+  try {
+    const supabase = await db();
+    const { data, error } = await supabase
+      .from("whatsapp_messages")
+      .select("direction, message_text")
+      .eq("from_phone", phone)
+      .eq("direction", "outbound")
+      .order("created_at", { ascending: false })
+      .limit(12);
+    if (error) return "";
+    return (data ?? [])
+      .map((row) => row.message_text)
+      .filter((message): message is string => typeof message === "string" && Boolean(message.trim()))
+      .slice(0, 4)
+      .reverse()
+      .map((message) => modelSafeText(message).slice(0, 240))
+      .join("\n");
+  } catch {
+    return "";
+  }
+}
+
+export async function interpretRegistrationReply(text: string, role: string, currentKey: string, phone: string): Promise<Record<string, string | number>> {
+  const fallback = extractRegistrationFields(text);
+  if (role === "ngo" && fallback["daily_meals"] !== undefined) {
+    fallback["capacity_meals"] = fallback["daily_meals"];
+    delete fallback["daily_meals"];
+  }
+  if (!process.env["GROQ_API_KEY"] || !text.trim() || currentKey === "email") return fallback;
+  try {
+    const context = await recentAssistantContext(phone);
+    const response = await requestGroqText({
+      instructions: `Interpret a ResQFood ${role} registration reply. Return only JSON object with keys from ${REGISTRATION_KEYS.join(", ")} and optional "question" boolean. Use only information explicitly present in the user's message; never infer missing facts. Extract fields from natural language. Do not perform actions or claim anything was saved.`,
+      input: `Current field: ${currentKey}. Recent assistant messages:\n${context}\nCurrent user message: ${modelSafeText(text)}`,
+      json: true,
+      maxOutputTokens: 180,
+    });
+    if (!response.ok) return fallback;
+    const parsed = JSON.parse(response.text) as Record<string, unknown>;
+    const fields: Record<string, string | number> = { ...fallback };
+    for (const key of REGISTRATION_KEYS) {
+      const value = parsed[key];
+      if ((typeof value === "string" || typeof value === "number") && String(value).trim()) {
+        const target = role === "ngo" && key === "daily_meals" ? "capacity_meals" : key;
+        // Accept only extracted text that is actually present in the user's message.
+        if (text.toLocaleLowerCase().includes(String(value).toLocaleLowerCase())) fields[target] = value;
+        if ((target === "daily_meals" || target === "capacity_meals") && typeof value === "number" && Number.isInteger(value) && value > 0) fields[target] = value;
+      }
+    }
+    if (parsed["question"] === true) fields["__question"] = 1;
+    return fields;
+  } catch {
+    return fallback;
+  }
+}
+
+async function gptConversationalReply(text: string, role: string | null, state: string, phone: string): Promise<string | null> {
+  if (!process.env["GROQ_API_KEY"] || !text.trim()) return null;
+  try {
+    const context = await recentAssistantContext(phone);
+    const response = await requestGroqText({
+      instructions: "You are the ResQFood AI WhatsApp assistant. Answer briefly and helpfully using only the current app context. Do not claim registrations, database writes, food safety approvals, allocations, acceptances, deliveries, or other actions succeeded. If uncertain, say so and direct the person to the menu. Never request passwords, API keys, or payment details.",
+      input: `Current participant role: ${role ?? "unregistered"}. Workflow state: ${state}. Recent assistant messages:\n${context}\nCurrent user message: ${modelSafeText(text)}`,
+      maxOutputTokens: 120,
+    });
+    if (!response.ok) return null;
+    return response.text.slice(0, 600);
+  } catch {
+    return null;
+  }
+}
+
 // ──────────────────────────────────────────────
 // Session helpers
 // ──────────────────────────────────────────────
@@ -289,20 +405,52 @@ async function handleRegistration(
   // Step 2: collect fields
   if (session.state === "reg_collecting") {
     const fields = role === "kitchen" ? KITCHEN_REG_FIELDS : NGO_REG_FIELDS;
-    const collectedKeys = Object.keys(data).filter((k) => k !== "reg_index");
     const currentIndex = (data.reg_index as number) ?? 0;
 
     // Store the answer for the current field
     const currentField = fields[currentIndex];
     if (currentField) {
-      let value: string | number = text.trim();
-      if (currentField.key === "daily_meals" || currentField.key === "capacity_meals") {
-        const n = Number(value.replace(/[^\d]/g, ""));
-        if (!n || n <= 0) return "Please enter a valid number.";
-        value = n;
+      const trimmed = text.trim();
+      if (!trimmed) return `I didn't receive an answer.\n\n${currentField.prompt}`;
+      if (isConversationalQuestion(trimmed)) {
+        const answer = await gptConversationalReply(trimmed, role ?? null, session.state, session.phone);
+        return `${answer ?? "I can help with registration. You can ask for clarification, or answer this field when ready."}\n\n${currentField.prompt}`;
       }
-      if (value.toLowerCase() === "skip") value = "";
-      await setSessionData(session, { [currentField.key]: value, reg_index: currentIndex + 1 });
+      const extracted = await interpretRegistrationReply(trimmed, role ?? "user", currentField.key, session.phone);
+      if (extracted["__question"]) return `I can help with that. Your registration is saved as you go.\n\n${currentField.prompt}`;
+      const updates: Record<string, unknown> = {};
+      for (const key of REGISTRATION_KEYS) {
+        if (!(key in extracted)) continue;
+        const candidate = extracted[key];
+        if (key === "daily_meals" || key === "capacity_meals") {
+          const n = parseRegistrationCapacityAnswer(trimmed, candidate);
+          if (!n) {
+            if (key === currentField.key) return `Please enter a whole number only (for example, 50).\n\n${currentField.prompt}`;
+            continue;
+          }
+          updates[key] = n;
+        } else if (typeof candidate === "string") {
+          updates[key] = candidate.trim();
+        }
+      }
+      if (trimmed.toLowerCase() === "skip" && ["email", "food_requirements"].includes(currentField.key)) updates[currentField.key] = "";
+      if (["daily_meals", "capacity_meals"].includes(currentField.key) && !(currentField.key in updates)) {
+        const capacity = parseRegistrationCapacityAnswer(trimmed, extracted[currentField.key]);
+        if (!capacity) return `Please enter a positive whole number of meals only (for example, 50).\n\n${currentField.prompt}`;
+        updates[currentField.key] = capacity;
+      }
+      if (!(currentField.key in updates) && !("__question" in extracted) && Object.keys(extracted).length === 0) updates[currentField.key] = trimmed;
+      if (!(currentField.key in updates) && Object.keys(updates).length === 0) {
+        const answer = await gptConversationalReply(trimmed, role ?? null, session.state, session.phone);
+        return `${answer ?? "I couldn't identify an answer for that field."}\n\n${currentField.prompt}`;
+      }
+      const merged = { ...data, ...updates };
+      let nextIndex = 0;
+      while (nextIndex < fields.length && String(merged[fields[nextIndex].key] ?? "").trim()) nextIndex++;
+      await setSessionData(session, { ...updates, reg_index: nextIndex });
+      if (nextIndex !== currentIndex + 1) {
+        return `I noted the details you provided.\n\n${fields[nextIndex]?.prompt ?? ""}`;
+      }
     }
 
     const nextIndex = currentIndex + 1;
@@ -562,6 +710,7 @@ async function processFoodAssessment(
 
   let analysis: AssessmentResult;
   let imageRef = media?.url ?? "inline-upload";
+  let assessmentStage: "media_download" | "groq_request" = media?.base64 ? "groq_request" : "media_download";
 
   try {
     const mediaData = media!.base64
@@ -571,6 +720,7 @@ async function processFoodAssessment(
       // Need to download from Twilio URL
       const { downloadTwilioMedia } = await import("./pipeline.server");
       const downloaded = await downloadTwilioMedia(media!.url!);
+      assessmentStage = "groq_request";
       analysis = await analyzeFoodImage(downloaded.base64, downloaded.contentType, {
         foodName: data.food_name as string | undefined,
         userQuantity: data.quantity as number | undefined,
@@ -581,23 +731,29 @@ async function processFoodAssessment(
         userQuantity: data.quantity as number | undefined,
       });
     }
-  } catch (e) {
-    console.error("AI assessment failed", e);
-    // NEVER fabricate a successful result on failure
-    analysis = {
-      food_name: (data.food_name as string) || "Unknown",
-      estimated_portions: 0,
-      estimated_weight_kg: 0,
-      quality_screening_status: "REVIEW_REQUIRED",
-      assessment_note: "AI assessment could not be completed. Please retry with a clearer photo or request manual review.",
-      analysis_mode: "live_ai",
-      model: null,
-      visual_quality: "Unknown",
-      freshness: "Unknown",
-      confidence_percent: 0,
-      safety_status: "REVIEW_REQUIRED",
-    };
-    imageRef = imageRef + " (analysis failed)";
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "";
+    const statusMatch = message.match(/\[(\d{3})\]/);
+    const status = statusMatch ? Number(statusMatch[1]) : null;
+    const category = /GROQ_API_KEY missing/.test(message)
+      ? "missing_groq_key"
+      : /not configured/.test(message)
+        ? "media_credentials_missing"
+        : assessmentStage === "groq_request" && status === 404
+          ? "model_not_found"
+        : status !== null
+          ? "upstream_http_error"
+          : error instanceof Error && error.name === "TimeoutError"
+            ? "timeout"
+            : assessmentStage === "media_download"
+              ? "media_retrieval_error"
+              : error instanceof SyntaxError
+                ? "invalid_model_json"
+                : /structured|invalid|omitted|identify|estimate|confidence|screening|visual quality/i.test(message)
+                  ? "invalid_model_result"
+                  : "model_request_error";
+    console.error("[WhatsApp assessment] Failed", JSON.stringify({ stage: assessmentStage, category, httpStatus: status }));
+    return ASSESSMENT_RETRY_MESSAGE;
   }
 
   // Persist assessment
@@ -611,7 +767,7 @@ async function processFoodAssessment(
       ai_estimated_quantity: analysis.estimated_portions,
       ai_estimated_weight: analysis.estimated_weight_kg,
       quality_screening_status: analysis.quality_screening_status,
-      assessment_note: analysis.assessment_note,
+      assessment_note: `${analysis.assessment_note} Limitations: ${analysis.limitations.join("; ")}`.slice(0, 300),
       analysis_mode: analysis.analysis_mode,
       model: analysis.model,
       visual_quality: analysis.visual_quality,
@@ -649,6 +805,7 @@ function formatAssessmentMessage(a: AssessmentResult): string {
   if (a.confidence_percent > 0) lines.push(`🎯 Confidence: ${a.confidence_percent}%`);
   lines.push(`✅ Assessment: ${a.quality_screening_status}`);
   if (a.assessment_note) lines.push("", a.assessment_note);
+  if (a.limitations.length) lines.push(`Limitations: ${a.limitations.join("; ")}`);
   lines.push(
     "",
     "Is this correct?",
@@ -856,7 +1013,9 @@ async function handleNgoMessage(
 export async function processConversation(input: ConversationInput): Promise<ConversationResult> {
   const supabase = await db();
   const phone = normalizePhone(input.from);
-  const type = classify(input.text, input.media);
+  const text = normalizeConversationText(input.text);
+  const media = normalizeConversationMedia(input.text, input.media);
+  const type = media ? classify(text, media) : "text";
   const channel = input.channel;
 
   // Deduplicate by messageSid for live WhatsApp
@@ -891,8 +1050,8 @@ export async function processConversation(input: ConversationInput): Promise<Con
     from_phone: phone,
     provider_message_id: input.messageSid ?? null,
     message_type: type,
-    message_text: input.text || null,
-    media_reference: input.media?.url ?? (input.media ? "inline-upload" : null),
+    message_text: text || null,
+    media_reference: media?.url ?? (media ? "inline-upload" : null),
     direction: "inbound",
     mode: channel === "whatsapp" ? "live" : "demo",
   });
@@ -900,10 +1059,19 @@ export async function processConversation(input: ConversationInput): Promise<Con
   // Route through the state machine
   let reply: string;
   try {
-    reply = await routeMessage(session, kitchen, ngo, text, type, input.media, inboundId, phone);
+    reply = await routeMessage(session, kitchen, ngo, text, type, media, inboundId, phone);
+    const genericReply = reply === KITCHEN_MENU || reply === NGO_MENU || reply.includes('Reply "hi" to get started') || reply.includes('Reply "register" to get started');
+    const safeFallback = reply.startsWith("Sorry, I didn't understand") || reply.startsWith("You're not registered yet.");
+    if ((genericReply || safeFallback) && type === "text") {
+      const conversational = await gptConversationalReply(text, session.role, session.state, session.phone);
+      if (conversational) reply = `${conversational}\n\n${reply}`;
+    }
   } catch (e) {
-    console.error("Conversation engine error", e);
-    reply = "Sorry, something went wrong while processing your message. Please try again.";
+    const details = safeErrorDetails(e);
+    console.error("[WhatsApp simulator] Conversation processing failed:", details);
+    reply = process.env["NODE_ENV"] === "development"
+      ? `Simulator processing error: ${details}`
+      : "Sorry, something went wrong while processing your message. Please try again.";
   }
 
   // Log outbound
@@ -918,6 +1086,29 @@ export async function processConversation(input: ConversationInput): Promise<Con
   });
 
   return { reply, session };
+}
+
+/** Return a short diagnostic without exposing keys, bearer tokens, or stacks. */
+export function safeErrorDetails(error: unknown): string {
+  const name = error instanceof Error ? error.name : "Error";
+  let message = error instanceof Error ? error.message : String(error);
+  const configuredSecrets = [
+    process.env["SUPABASE_SERVICE_ROLE_KEY"],
+    process.env["SUPABASE_PUBLISHABLE_KEY"],
+    process.env["VITE_SUPABASE_PUBLISHABLE_KEY"],
+    process.env["TWILIO_API_KEY"],
+    process.env["TWILIO_AUTH_TOKEN"],
+    process.env["WHATSAPP_WEBHOOK_TOKEN"],
+    process.env["GROQ_API_KEY"],
+    process.env["WEATHER_API_KEY"],
+    process.env["OPENAI_API_KEY"],
+  ].filter((value): value is string => Boolean(value && value.length >= 8));
+  for (const secret of configuredSecrets) message = message.replaceAll(secret, "[redacted]");
+  message = message
+    .replace(/\b(?:sb_secret|sb_publishable)_[A-Za-z0-9_-]+/g, "[redacted key]")
+    .replace(/\bBearer\s+[^\s,;]+/gi, "Bearer [redacted]")
+    .replace(/https?:\/\/[^\s:@/]+:[^\s@/]+@/gi, "[redacted URL]@");
+  return `${name}: ${message.slice(0, 300)}`;
 }
 
 async function routeMessage(

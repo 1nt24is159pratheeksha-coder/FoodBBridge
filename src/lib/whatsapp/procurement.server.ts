@@ -42,6 +42,7 @@ export interface ProcurementResult {
     unit: string;
     in_stock: number;
     recommended_purchase: number;
+    inventory_recorded: boolean;
   }[];
   note: string;
 }
@@ -56,7 +57,7 @@ export async function calculateProcurement(
   predictedServings: number,
   dishName?: string,
 ): Promise<ProcurementResult[]> {
-  const supabase = await db();
+  const supabase = (await db()) as unknown as SupabaseClient;
 
   // Fetch BOM recipes for this kitchen
   let query = supabase.from("bom_recipes").select("*").eq("kitchen_id", kitchenId);
@@ -87,6 +88,9 @@ export async function calculateProcurement(
   }
 
   const results: ProcurementResult[] = [];
+  const menuMixNote = recipes.length > 1 && !dishName
+    ? "Menu mix is not recorded. Each dish is shown as a separate what-if that assumes it supplies 100% of forecast meals; do not add purchase amounts across dishes."
+    : "";
 
   for (const recipe of recipes as unknown as BomRecipe[]) {
     const ingredients = (Array.isArray(recipe.ingredients) ? recipe.ingredients : []) as Ingredient[];
@@ -102,6 +106,7 @@ export async function calculateProcurement(
         unit: ing.unit,
         in_stock: inStock,
         recommended_purchase: recommendedPurchase,
+        inventory_recorded: Boolean(invItem),
       };
     });
 
@@ -109,7 +114,9 @@ export async function calculateProcurement(
       dish_name: recipe.dish_name,
       predicted_servings: predictedServings,
       ingredients: ingredientResults,
-      note: "Recommended purchase = Required − Current inventory. Does not place orders.",
+      note: [inventory?.length
+        ? "Required quantities use the recipe's per-serving amounts. Purchase quantity is required minus recorded stock; this calculation does not place orders."
+        : "No inventory items are recorded for this kitchen. Buy quantities assume zero recorded stock; update inventory for accurate recommendations.", menuMixNote].filter(Boolean).join(" "),
     });
   }
 
@@ -136,3 +143,5 @@ export function formatProcurementResult(results: ProcurementResult[]): string {
 
   return lines.join("\n");
 }
+import type { SupabaseClient } from "@supabase/supabase-js";
+

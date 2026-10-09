@@ -14,7 +14,8 @@ export type NgoRow = {
   conversation_state: string; pending_surplus_id: string | null; proposed_quantity: number | null;
 };
 
-type Offer = { id: string; food_name: string; unit: string; available: number; usable_until: string | null; pickup_location: string | null; kitchen: string };
+type Offer = { id: string; food_name: string; unit: string; available: number; usable_until: string | null; pickup_location: string | null; kitchen: string; state: string };
+import { isAvailableOffer, remainingOfferQuantity } from "./ngo-availability";
 
 export const NGO_MENU =
   "👋 Welcome to ResQFood AI. You are registered as an NGO/Recipient. How can I help?\n\n1 - Available Food\n2 - My Allocations\n3 - Delivery Status\n4 - Help";
@@ -63,11 +64,11 @@ async function availableOffers(db: Db): Promise<Offer[]> {
       const k = r.kitchens as { name: string; address: string | null } | null;
       return {
         id: r.id, food_name: r.food_name, unit: r.unit, usable_until: r.usable_until,
-        available: r.quantity - (used.get(r.id) ?? 0),
-        pickup_location: r.pickup_location ?? k?.address ?? null, kitchen: k?.name ?? "Partner kitchen",
+        available: remainingOfferQuantity(r.quantity, used.get(r.id) ?? 0),
+        pickup_location: r.pickup_location ?? k?.address ?? null, kitchen: k?.name ?? "Partner kitchen", state: r.state,
       };
     })
-    .filter((o) => o.available > 0 && (hoursLeft(o.usable_until) ?? 1) > 0);
+    .filter((o) => isAvailableOffer(o.state, o.available, o.usable_until));
 }
 
 function offerText(o: Offer, ngo: NgoRow) {
