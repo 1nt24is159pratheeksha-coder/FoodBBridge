@@ -1,4 +1,4 @@
-
+﻿
 import { useMemo, useState } from "react";
 import { createFileRoute, Link } from "@tanstack/react-router";
 import {
@@ -42,7 +42,7 @@ function TripCard({ trip }: { trip: Trip }) {
     <Link
       to="/driver/trip/$id"
       params={{ id: trip.id }}
-      className="surface block space-y-4 transition hover:border-primary/40 hover:shadow-md focus-visible:outline-2 focus-visible:outline-primary"
+      className="surface block w-full min-w-0 space-y-4 transition hover:border-primary/40 hover:shadow-md focus-visible:outline-2 focus-visible:outline-primary"
     >
       <div className="flex items-start gap-3">
         <span className="flex size-11 shrink-0 items-center justify-center rounded-xl bg-highlight text-primary">
@@ -69,7 +69,7 @@ function TripCard({ trip }: { trip: Trip }) {
         <ChevronRight className="mt-2 size-4 shrink-0 text-muted-foreground" />
       </div>
 
-      <div className="grid gap-2 sm:grid-cols-2">
+      <div className="grid min-w-0 grid-cols-2 gap-2">
         <Stop
           icon={<MapPin className="size-4" />}
           label="Pickup kitchen"
@@ -115,13 +115,13 @@ function Stop({
   address: string;
 }) {
   return (
-    <div className="rounded-lg border border-border bg-panel/60 p-3">
+    <div className="min-w-0 overflow-hidden rounded-lg border border-border bg-panel/60 p-3">
       <p className="flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-wide text-primary">
         {icon}
         {label}
       </p>
 
-      <p className="mt-1.5 text-sm font-semibold">{name}</p>
+      <p className="mt-1.5 break-words text-sm font-semibold">{name}</p>
 
       <p className="mt-0.5 line-clamp-2 text-xs text-muted-foreground">
         {address}
@@ -217,7 +217,7 @@ function Trips() {
 
       {loading && !trips.length ? (
         <p className="surface text-center text-sm text-muted-foreground">
-          Loading your trips…
+          Loading your tripsâ€¦
         </p>
       ) : visible.length ? (
         <ul className="space-y-3">
@@ -273,3 +273,4 @@ function Trips() {
     </div>
   );
 }
+
