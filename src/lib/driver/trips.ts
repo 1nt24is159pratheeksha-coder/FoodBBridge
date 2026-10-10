@@ -1,52 +1,52 @@
-import { createLocalStore } from "@/lib/local-store";
+import { useSyncExternalStore } from "react";
+import { listDriverTrips, mutateDriverTrip } from "@/lib/driver/trips.functions";
 
-/** Driver trip lifecycle (demo, browser storage). Pickup and delivery are both OTP-verified. */
 export const tripSteps = ["Offered", "Accepted", "At Pickup", "Picked Up", "In Transit", "At Delivery", "Completed"] as const;
-export type TripStatus = (typeof tripSteps)[number];
-
+export type TripStatus = (typeof tripSteps)[number] | "Rejected" | "Unavailable";
 export type Trip = {
-  id: string; food: string; quantity: string; kitchen: string; kitchenAddress: string; ngo: string; ngoAddress: string;
-  pickupKm: number; deliveryKm: number; availableUntil: string; pickupOtp: string; deliveryOtp: string;
-  status: TripStatus; history: { status: TripStatus; at: string }[];
+  id: string; food: string; quantity: string; quantityValue: number; unit: string; estimatedImpactKg?: number; kitchen: string; kitchenAddress: string; kitchenContact?: string; kitchenPhone?: string;
+  ngo: string; ngoAddress: string; ngoContact?: string; ngoPhone?: string;
+  availableUntil: string; status: TripStatus; history: { status: TripStatus; at: string }[];
 };
 
-export const DRIVER_PROFILE = { name: "Arjun Kumar", firstName: "Arjun", phone: "+91 98451 20987", vehicle: "Bike · KA-03-1122", zone: "Central Bengaluru" };
+type TripState = { trips: Trip[]; loading: boolean; error: string | null };
+let state: TripState = { trips: [], loading: false, error: null };
+const listeners = new Set<() => void>();
+let pending: Promise<void> | null = null;
+const publish = (next: TripState) => { state = next; listeners.forEach((listener) => listener()); };
+const subscribe = (listener: () => void) => {
+  listeners.add(listener);
+  if (!pending && !state.trips.length) void refreshTrips();
+  return () => { listeners.delete(listener); };
+};
+export const useTripState = () => useSyncExternalStore(subscribe, () => state, () => state);
+export const useTrips = () => useTripState().trips;
 
-const ago = (min: number) => new Date(Date.now() - min * 60_000).toISOString();
-const seed = (): Trip[] => [
-  { id: "TRIP-501", food: "Vegetarian Rice", quantity: "50 portions", kitchen: "Fresh Bites Cafe", kitchenAddress: "100 Ft Rd, Indiranagar", ngo: "Feed The City", ngoAddress: "Shivajinagar",
-    pickupKm: 2.1, deliveryKm: 4.3, availableUntil: "6:00 PM", pickupOtp: "4821", deliveryOtp: "7390", status: "Offered", history: [{ status: "Offered", at: ago(1) }] },
-  { id: "TRIP-498", food: "Paneer Curry", quantity: "35 portions", kitchen: "Fresh Bites Cafe", kitchenAddress: "100 Ft Rd, Indiranagar", ngo: "Little Hearts Home", ngoAddress: "Jayanagar",
-    pickupKm: 1.4, deliveryKm: 7.8, availableUntil: "3:00 PM", pickupOtp: "1194", deliveryOtp: "6603", status: "Completed",
-    history: tripSteps.map((status, i) => ({ status, at: ago(300 - i * 8) })) },
-];
-
-export const tripStore = createLocalStore<Trip[]>("resqfood.driver-trips.v1", seed);
-export const onlineStore = createLocalStore<boolean>("resqfood.driver-online.v1", () => true);
-export const useTrips = tripStore.useStore;
-
-const nextOf = (s: TripStatus) => tripSteps[tripSteps.indexOf(s) + 1];
-function move(id: string, from: TripStatus) {
-  tripStore.set((all) => all.map((t) => {
-    const to = nextOf(t.status);
-    return t.id === id && t.status === from && to ? { ...t, status: to, history: [...t.history, { status: to, at: new Date().toISOString() }] } : t;
-  }));
+export async function refreshTrips() {
+  if (pending) return pending;
+  const request = Promise.resolve().then(async () => {
+    publish({ ...state, loading: true, error: null });
+    try {
+      const trips = await listDriverTrips();
+      publish({ trips, loading: false, error: null });
+    } catch (error) {
+      publish({ ...state, loading: false, error: error instanceof Error ? error.message : "Unable to load trips." });
+    } finally { pending = null; }
+  });
+  pending = request;
+  return pending;
 }
 
-export const acceptTrip = (id: string) => move(id, "Offered");
-export const arriveAtPickup = (id: string) => move(id, "Accepted");
-export const startTransit = (id: string) => move(id, "Picked Up");
-export const arriveAtDelivery = (id: string) => move(id, "In Transit");
-
-/** Returns false when the code is wrong; the trip only advances on a correct OTP. */
-export function verifyTripOtp(id: string, kind: "pickup" | "delivery", otp: string) {
-  const t = tripStore.get().find((x) => x.id === id);
-  if (!t) return false;
-  const expectedStatus: TripStatus = kind === "pickup" ? "At Pickup" : "At Delivery";
-  const code = kind === "pickup" ? t.pickupOtp : t.deliveryOtp;
-  if (t.status !== expectedStatus || otp.trim() !== code) return false;
-  move(id, expectedStatus);
-  return true;
+export type TripAction = "accept" | "reject" | "arrive_pickup" | "verify_pickup" | "start_transit" | "arrive_delivery" | "verify_delivery";
+export async function performTripAction(id: string, action: TripAction, otp?: string) {
+  await mutateDriverTrip({ data: { id, action, ...(otp ? { otp } : {}) } });
+  await refreshTrips();
 }
+export const acceptTrip = (id: string) => performTripAction(id, "accept");
+export const rejectTrip = (id: string) => performTripAction(id, "reject");
+export const arriveAtPickup = (id: string) => performTripAction(id, "arrive_pickup");
+export const startTransit = (id: string) => performTripAction(id, "start_transit");
+export const arriveAtDelivery = (id: string) => performTripAction(id, "arrive_delivery");
+export const verifyTripOtp = (id: string, kind: "pickup" | "delivery", otp: string) => performTripAction(id, kind === "pickup" ? "verify_pickup" : "verify_delivery", otp);
 
-export const isActiveTrip = (t: Trip) => t.status !== "Offered" && t.status !== "Completed";
+export const isActiveTrip = (trip: Trip) => trip.status !== "Offered" && trip.status !== "Completed" && trip.status !== "Rejected" && trip.status !== "Unavailable";
